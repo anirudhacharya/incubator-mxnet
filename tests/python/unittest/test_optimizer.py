@@ -1002,6 +1002,87 @@ def test_adagrad():
                             compare_optimizer(opt1(**kwarg), opt2(**kwarg), shape, dtype,
                                               g_stype='row_sparse')
 
+# LGSGD
+class PyLBSGD(mx.optimizer.Optimizer):
+    """The python reference of LBSGD optimizer.
+
+    This class implements the LBSGD optimizer described in *Large Batch Training of
+    Convolutional Networks*, and available at -
+    https://arxiv.org/pdf/1708.03888.pdf.
+ 
+    Updates are applied by::
+
+        state = momentum * state + lr * rescale_grad * clip(grad, clip_gradient) + wd * weight
+        weight = weight - state
+
+    This optimizer accepts the following parameters in addition to those accepted
+    by :class:`.Optimizer`.
+
+    Parameters
+    ----------
+    momentum : float, optional
+        The momentum value.
+    multi_precision: bool, optional
+        Flag to control the internal precision of the optimizer.::
+
+            False: results in using the same precision as the weights (default),
+            True: makes internal 32-bit copy of the weights and applies gradients
+            in 32-bit precision even if actual weights used in the model have lower precision.
+            Turning this on can improve convergence and accuracy when training with float16.
+
+    warmup_strategy: string ('linear', 'power2', 'sqrt'. , 'lars'   default : 'linear')
+    warmup_epochs: unsigned, default: 5
+    batch_scale:   unsigned, default: 1 (same as batch size*numworkers)
+    updates_per_epoch: updates_per_epoch (default: 32, Default might not reflect true number batches per epoch. Used for warmup.)
+    begin_epoch: unsigned, default 0, starting epoch.
+
+    """
+    def __init__(self, eps=1e-7, **kwargs):
+        super(PyAdaGrad, self).__init__(**kwargs)
+        self.float_stable_eps = eps
+
+    def create_state(self, index, weight):
+        return mx.nd.zeros(weight.shape, weight.context, stype=weight.stype)
+
+    def update(self, index, weight, grad, state):
+        self._update_count(index)
+        lr = self._get_lr(index)
+        wd = self._get_wd(index)
+
+        history = state
+        grad = grad * self.rescale_grad
+        if self.clip_gradient is not None:
+            grad = mx.nd.clip(grad, -self.clip_gradient, self.clip_gradient)
+        history[:] += mx.nd.square(grad)
+        div = grad / mx.nd.sqrt(history + self.float_stable_eps)
+        weight[:] += (div + weight * wd) * -lr
+
+def test_lbsgd():
+    mx.random.seed(0)
+    opt1 = PyLBSGD
+    opt2 = mx.optimizer.LBSGD
+    shape = (3, 4, 5)
+    eps_options = [{}, {'eps': 1e-8}]
+    cg_options = [{}, {'clip_gradient': 0.4}, {'clip_gradient': 0.5}]
+    rg_options = [{}, {'rescale_grad': 0.14}, {'rescale_grad': 0.8}]
+    wd_options = [{}, {'wd': 0.0}]
+    for dtype in [np.float32]:
+        for eps_option in eps_options:
+            for cg_option in cg_options:
+                for rg_option in rg_options:
+                    for wd_option in wd_options:
+                        kwarg = {}
+                        kwarg.update(eps_option)
+                        kwarg.update(cg_option)
+                        kwarg.update(rg_option)
+                        kwarg.update(wd_option)
+                        compare_optimizer(opt1(**kwarg), opt2(**kwarg), shape, dtype)
+                        if wd_option.get('wd', 0.0) == 0.0:
+                            compare_optimizer(opt1(**kwarg), opt2(**kwarg), shape, dtype,
+                                              w_stype='row_sparse', g_stype='row_sparse')
+                            compare_optimizer(opt1(**kwarg), opt2(**kwarg), shape, dtype,
+                                              g_stype='row_sparse')
+
 
 def test_factor_scheduler():
     base_lr = 1
