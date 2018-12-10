@@ -18,7 +18,9 @@
 """Data iterators for common data formats."""
 from __future__ import absolute_import
 from collections import namedtuple
+from collections import deque
 
+import os
 import sys
 import ctypes
 import logging
@@ -35,8 +37,25 @@ from ..ndarray.sparse import CSRNDArray
 from ..ndarray import _ndarray_cls
 from ..ndarray import array
 from ..ndarray import concat
+from .. import recordio
 
 from .utils import _init_data, _has_instance, _getdata_by_idx
+try:
+    import Queue as queue
+except ImportError as ie:
+    import queue as queue
+try:
+    import cv2
+except ImportError:
+    cv2 = Nonem,∂
+import multiprocessing as mp
+import itertools
+from multiprocessing.managers import SyncManager
+from functools import partial
+
+class SharedObjectManager(SyncManager):
+    pass
+SharedObjectManager.register("PriorityQueue", queue.PriorityQueue)
 
 class DataDesc(namedtuple('DataDesc', ['name', 'shape'])):
     """DataDesc is used to store name, shape, type and layout
@@ -965,6 +984,152 @@ def _make_io_iterator(handle):
     creator.__name__ = iter_name
     creator.__doc__ = doc_str
     return creator
+
+
+def _read_list(list_file, batch_size):
+    """
+    Helper function that reads the .lst file, binds it in
+    a generator and returns a batched version of the generator.
+    Parameters
+    ----------
+    list_file: input list file.
+    batch_size: batch size of the generator
+    Returns
+    -------
+    item iterator that contains information in .lst file
+    """
+    def get_generator():
+        with open(list_file) as fin:
+            while True:
+                line = fin.readline()
+                if not line:
+                    break
+                line = [i.strip() for i in line.strip().split('\t')]
+                line_len = len(line)
+                # check the data format of .lst file
+                if line_len < 3:
+                    logging.info("lst should have at least has three parts, "
+                                + "but only has {} parts for {}".format(line_len, line))
+                    continue
+                try:
+                    item = [int(line[0])] + [line[-1]] + [float(i) for i in line[1:-1]]
+                except Exception as e:
+                    logging.info('Parsing lst met error for {}, detail: {}'.format(line, e))
+                    continue
+                yield item
+    data_iter = iter(get_generator())
+    data_batch = list(itertools.islice(data_iter, batch_size))
+    while data_batch:
+        yield data_batch
+        data_batch = list(itertools.islice(data_iter, batch_size))
+
+def _read_worker(q_out, transforms, color, quality, encoding, data_record):
+    """
+    Helper function that will be run by the read workers
+    to fetch the image from the input queue apply
+    transformations and put it into output priority queue.
+    Parameters
+    ----------
+    args: object
+    q_out: queue
+    transforms: transformations
+    color: color
+    quality: quality
+    encoding: encoding
+    deq: image instance to work on.
+    """
+    i, item = data_record
+    fullpath = os.path.join(args.root, item[1])
+
+    # construct the header of the record
+    if len(item) > 3:
+        header = mx.recordio.IRHeader(0, item[2:], item[0], 0)
+    else:
+        header = mx.recordio.IRHeader(0, item[2], item[0], 0)
+
+    try:
+        img = cv2.imread(fullpath, color)
+        if img is None:
+            logging.info('imread read blank (None) image for file: %s' % fullpath)
+            return
+        img = transforms(img)
+        s = mx.recordio.pack_img(header, img, quality = quality,
+        img_fmt = encoding)
+        q_out.put((i, s, item))
+    except Exception as e:
+        logging.info('pack_img error on file: %s' % fullpath, e)
+        return
+
+def _validate_filenames(list_file, output_path):
+    """
+    Helper function to validate the file paths of
+    the input list file and output .rec file path.
+    Parameters
+    --------
+    list_file: input list file path
+    output_path: path to the output directory
+    """
+    if not os.path.isfile(list_file):
+        raise Exception("Input list file is invalid - \
+            1. Wrong filename or file path \n2. List file should be of format *.lst")
+    if not os.path.isdir(output_path):
+        raise Exception("Output path should be a directory where the \
+            rec files will be stored.")
+
+def _count_elem(iter):
+    """
+    Helper function to count the number of elements in
+    a generator.
+    Parameters
+    -----
+    iter: generator object
+    Returns
+    -----
+    count: total count of elements
+    """    
+    cnt = itertools.count()
+    deque(zip(iter, cnt), 0)
+    return next(cnt)
+
+def im2rec(list_file, transforms, dataset_params, output_path):
+    """
+    API to convert the input image dataset into recordIO file format
+    """
+    _validate_filenames(list_file, output_path)
+    shared_obj_mgr = SharedObjectManager()
+    shared_obj_mgr.start()
+
+    num_workers = dataset_params.get('num_workers', 63)
+    batch_size = dataset_params.get('batch_size', 4096)
+    parts = dataset_params.get('parts', 1)
+    color = dataset_params.get('color', 1)
+    encoding = dataset_params.get('encoding', '.jpg')
+    quality = dataset_params.get('quality', 95)
+
+    data_batch_iter = _read_list(fname, batch_size)
+    # A process-safe PriorityQueue
+    out_q = shared_obj_mgr.PriorityQueue(batch_size)
+    pool = mp.Pool(num_workers)
+    for data_batch in data_batch_iter:
+        pool.map(partial(read_worker, out_q, transforms,
+                         color, quality, encoding), data_batch)
+        
+        # write the records into recordio file
+        fname_rec = os.path.splitext(output_path) + '.rec'
+        fname_idx = os.path.splitext(output_path) + '.idx'
+        record = mx.recordio.MXIndexedRecordIO(os.path.join(working_dir, fname_idx),
+                                            os.path.join(working_dir, fname_rec), 'w')
+        buf = {}
+        while not q_out.empty():
+            deq = q_out.get()
+            i, s, item = deq
+            buf[i] = (s, item)
+            while count in buf:
+                s, item = buf[count]
+                del buf[count]
+                if s is not None:
+                    record.write_idx(item[0], s)
+    
 
 def _init_io_module():
     """List and add all the data iterators to current module."""
