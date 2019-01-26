@@ -28,16 +28,15 @@ from ..base import py_str
 from ..ndarray import (NDArray, zeros, clip, sqrt, cast, maximum, abs as NDabs, array, multiply)
 from ..ndarray import (sgd_update, sgd_mom_update, adam_update, rmsprop_update, rmspropalex_update,
                        mp_sgd_update, mp_sgd_mom_update, square, ftrl_update, ftml_update,
-                       signsgd_update, signum_update,
-                       multi_sgd_update, multi_sgd_mom_update, multi_mp_sgd_update,
-                       multi_mp_sgd_mom_update)
+                       signsgd_update, signum_update, multi_sgd_update, multi_sgd_mom_update,
+                       multi_mp_sgd_update, multi_mp_sgd_mom_update, amsgrad_update)
 from ..ndarray import sparse
 from ..random import normal
 
 __all__ = [
-    'AdaDelta', 'AdaGrad', 'Adam', 'Adamax', 'DCASGD', 'FTML', 'Ftrl', 'LBSGD',
-    'NAG', 'NDabs', 'Nadam', 'Optimizer', 'RMSProp', 'SGD', 'SGLD', 'Signum',
-    'Test', 'Updater', 'ccSGD', 'create', 'get_updater', 'register'
+    'AdaDelta', 'AdaGrad', 'Adam', 'AMSGrad', 'Adamax', 'DCASGD', 'FTML', 'Ftrl',
+    'LBSGD', 'NAG', 'NDabs', 'Nadam', 'Optimizer', 'RMSProp', 'SGD', 'SGLD',
+    'Signum', 'Test', 'Updater', 'ccSGD', 'create', 'get_updater', 'register'
 ]
 
 def _flatten_list(nested_list):
@@ -1189,6 +1188,80 @@ class Adam(Optimizer):
         mean, var = state
         adam_update(weight, grad, mean, var, out=weight,
                     lazy_update=self.lazy_update, lr=lr, wd=wd, **kwargs)
+
+
+@register
+class AMSGrad(Optimizer):
+    """The AMSGrad optimizer.
+
+    This class implements the AMSGrad optimizer described in *On The
+    Convergence Of Adam And Beyond*, and available at
+    https://openreview.net/pdf?id=ryQu7f-RZ.
+
+    This optimizer updates each weight by::
+
+        grad = clip(grad * rescale_grad + wd * weight, clip_gradient)
+        m = beta1 * m_t + (1 - beta1) * grad
+        v_cap = beta2 * v_t + (1 - beta2) * grad * grad
+        v_cap = maximum(v_cap, v_t)
+        weight += - lr * m / (v_cap**0.5 + epsilon)
+
+    This optimizer accepts the following parameters in addition to those accepted
+    by :class:`.Optimizer`.
+
+    Parameters
+    ----------
+    beta1 : float, optional
+        Exponential decay rate for the first moment estimates.
+    beta2 : float, optional
+        Exponential decay rate for the second moment estimates.
+    epsilon : float, optional
+        Small value to avoid division by 0.
+    """
+    def __init__(self, learning_rate=0.001, beta1=0.9, beta2=0.999, epsilon=1e-8,
+                 **kwargs):
+        super(AMSGrad, self).__init__(learning_rate=learning_rate, **kwargs)
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.epsilon = epsilon
+
+    def create_state(self, index, weight):
+        stype = weight.stype if self.lazy_update else 'default'
+        return (zeros(weight.shape, weight.context, dtype=weight.dtype,
+                      stype=stype),  # mean, first moment
+                zeros(weight.shape, weight.context, dtype=weight.dtype,
+                      stype=stype))  # variance, second moment
+
+    def update(self, index, weight, grad, state):
+        assert(isinstance(weight, NDArray))
+        assert(isinstance(grad, NDArray))
+        self._update_count(index)
+        lr = self._get_lr(index)
+        wd = self._get_wd(index)
+
+        '''
+        kwargs = {'beta1': self.beta1, 'beta2': self.beta2,
+                  'epsilon': self.epsilon}
+        if self.clip_gradient:
+            kwargs['clip_gradient'] = self.clip_gradient
+
+        mean, var = state
+        amsgrad_update(weight, grad, mean, var, out=weight,
+                        lr=lr, wd=wd, **kwargs)
+        '''
+        grad *= self.rescale_grad
+        grad += wd * weight
+        if self.clip_gradient is not None:
+            grad = clip(grad, -self.clip_gradient, self.clip_gradient)
+
+        m_t, v_t = state
+        m_t[:] *= self.beta1
+        m_t[:] += (1 - self.beta1) * grad
+        v = self.beta2 * v_t
+        v[:] += (1 - self.beta2) * (grad ** 2)
+        v = maximum(v, v_t)
+        weight[:] += - lr * m_t / (sqrt(v) + self.epsilon)
+
 
 @register
 class AdaGrad(Optimizer):

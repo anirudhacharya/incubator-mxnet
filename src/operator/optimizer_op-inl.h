@@ -1169,6 +1169,81 @@ inline void AdamUpdate(const nnvm::NodeAttrs& attrs,
   });
 }
 
+
+struct AMSGradParam : public dmlc::Parameter<AMSGradParam> {
+  float lr;
+  float beta1;
+  float beta2;
+  float epsilon;
+  float wd;
+  float rescale_grad;
+  float clip_gradient;
+  DMLC_DECLARE_PARAMETER(AdamParam) {
+    DMLC_DECLARE_FIELD(lr)
+    .describe("Learning rate");
+    DMLC_DECLARE_FIELD(beta1)
+    .set_default(0.9f)
+    .describe("The decay rate for the 1st moment estimates.");
+    DMLC_DECLARE_FIELD(beta2)
+    .set_default(0.999f)
+    .describe("The decay rate for the 2nd moment estimates.");
+    DMLC_DECLARE_FIELD(epsilon)
+    .set_default(1e-8f)
+    .describe("A small constant for numerical stability.");
+    DMLC_DECLARE_FIELD(wd)
+    .set_default(0.0f)
+    .describe("Weight decay augments the objective function with a "
+              "regularization term that penalizes large weights. "
+              "The penalty scales with the square of the magnitude of each weight.");
+    DMLC_DECLARE_FIELD(rescale_grad)
+    .set_default(1.0f)
+    .describe("Rescale gradient to grad = rescale_grad*grad.");
+    DMLC_DECLARE_FIELD(clip_gradient)
+    .set_default(-1.0f)
+    .describe("Clip gradient to the range of [-clip_gradient, clip_gradient] "
+              "If clip_gradient <= 0, gradient clipping is turned off. "
+              "grad = max(min(grad, clip_gradient), -clip_gradient).");
+  }
+};
+
+template<typename xpu>
+inline void AMSGradUpdate(const nnvm::NodeAttrs& attrs,
+                       const OpContext &ctx,
+                       const std::vector<TBlob> &inputs,
+                       const std::vector<OpReqType> &req,
+                       const std::vector<TBlob> &outputs) {
+  using namespace mshadow;
+  using namespace mshadow::expr;
+  using namespace mshadow_op;
+  const AdamParam& param = nnvm::get<AdamParam>(attrs.parsed);
+  Stream<xpu>* s = ctx.get_stream<xpu>();
+  MSHADOW_REAL_TYPE_SWITCH(inputs[0].type_flag_, DType, {
+    Tensor<xpu, 2, DType> weight = inputs[0].FlatTo2D<xpu, DType>(s);
+    Tensor<xpu, 2, DType> grad = inputs[1].FlatTo2D<xpu, DType>(s);
+    Tensor<xpu, 2, DType> mean = inputs[2].FlatTo2D<xpu, DType>(s);
+    Tensor<xpu, 2, DType> var = inputs[3].FlatTo2D<xpu, DType>(s);
+    Tensor<xpu, 2, DType> out = outputs[0].FlatTo2D<xpu, DType>(s);
+
+    grad = scalar<DType>(param.rescale_grad) * grad +
+      scalar<DType>(param.wd) * weight;
+
+    if (param.clip_gradient >= 0.0f) {
+      mean = scalar<DType>(param.beta1)*mean + scalar<DType>(1.f-param.beta1) *
+          F<clip>(grad, DType(param.clip_gradient));
+      var = scalar<DType>(param.beta2)*var + scalar<DType>(1.f-param.beta2)*F<square>(
+          F<clip>(grad, DType(param.clip_gradient)));
+    } else {
+      mean = scalar<DType>(param.beta1)*mean + scalar<DType>(1.f-param.beta1) * grad;
+      var = scalar<DType>(param.beta2)*var + scalar<DType>(1.f-param.beta2) * F<square>(grad);
+    }
+    Assign(out, req[0],
+           weight -
+           scalar<DType>(param.lr) * mean /
+           (F<square_root>(var) + scalar<DType>(param.epsilon)));
+  });
+}
+
+
 template<int req, typename xpu>
 struct AdamDnsRspDnsKernel;
 

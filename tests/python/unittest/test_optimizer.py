@@ -697,6 +697,97 @@ def test_adam():
                                           dtype, w_stype='default', g_stype='row_sparse',
                                           rtol=1e-4, atol=2e-5)
 
+
+# AMSGrad
+class PyAMSGrad(mx.optimizer.Optimizer):
+    """python reference implemenation of adam"""
+    def __init__(self, learning_rate=0.001, beta1=0.9, beta2=0.999,
+                 epsilon=1e-8, **kwargs):
+        super(PyAMSGrad, self).__init__(learning_rate=learning_rate, **kwargs)
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.epsilon = epsilon
+
+    def create_state(self, index, weight):
+        """Create additional optimizer state: mean, variance
+
+        Parameters
+        ----------
+        weight : NDArray
+        The weight data
+
+        """
+        return (mx.nd.zeros(weight.shape, weight.context, dtype=weight.dtype),  # mean
+                mx.nd.zeros(weight.shape, weight.context, dtype=weight.dtype))  # variance
+
+    def update(self, index, weight, grad, state):
+        """Update the parameters.
+
+        Parameters
+        ----------
+        index : int
+        An unique integer key used to index the parameters
+
+        weight : NDArray
+        weight ndarray
+
+        grad : NDArray
+        grad ndarray
+
+        state : NDArray or other objects returned by init_state
+        The auxiliary state used in optimization.
+        """
+        lr = self._get_lr(index)
+        self._update_count(index)
+
+        mean, variance = state
+        wd = self._get_wd(index)
+        num_rows = weight.shape[0]
+
+        for row in range(num_rows):
+            # check row slices of all zeros
+            all_zeros = mx.test_utils.almost_equal(grad[row].asnumpy(), np.zeros_like(grad[row].asnumpy()))
+            # skip zeros during lazy update
+            if all_zeros:
+                continue
+            grad[row] *= self.rescale_grad
+            grad[row] += wd * weight[row]
+            # clip gradients
+            if self.clip_gradient is not None:
+                mx.nd.clip(grad[row], -self.clip_gradient, self.clip_gradient, out=grad[row])
+            # update mean
+            mean[row] *= self.beta1
+            mean[row] += grad[row] * (1. - self.beta1)
+            # update variance
+            cur_variance = self.beta2 * variance[row]
+            cur_variance += (1 - self.beta2) * mx.nd.square(grad[row], out=grad[row])
+            variance[row] = mx.nd.maximum(variance[row], cur_variance)
+            # update weight
+            weight[row] -= lr * mean[row] / (mx.nd.sqrt(variance[row]) + self.epsilon)
+
+
+@with_seed()
+def test_amsgrad():
+    opt1 = PyAMSGrad
+    opt2 = mx.optimizer.AMSGrad
+    shape = (3, 4, 5)
+    cg_options = [{}, {'clip_gradient': 0.4}, {'clip_gradient': 0.5}]
+    rg_options = [{}, {'rescale_grad': 0.14}, {'rescale_grad': 0.8}]
+    wd_options = [{}, {'wd': 0.03}, {'wd': 0.05}, {'wd': 0.07}]
+    mp_options = [{}, {'multi_precision': False}, {'multi_precision': True}]
+
+    for dtype in [np.float16, np.float32, np.float64]:
+        for params in itertools.product(cg_options, rg_options, wd_options,
+                                        mp_options):
+            kwarg = {k: v for param in params for k, v in param.items()}
+            if (dtype == np.float16 and ('multi_precision' not in kwarg or
+                                         not kwarg['multi_precision'])):
+                continue
+            # atol 2e-5 needed to pass with seed 1248389097
+            compare_optimizer(opt1(**kwarg), opt2(**kwarg), shape, dtype,
+                              rtol=1e-4, atol=2e-5)
+
+
 # AdaMax
 class PyAdamax(mx.optimizer.Optimizer):
     """The python reference of AdaMax optimizer.
