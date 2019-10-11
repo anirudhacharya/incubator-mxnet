@@ -1043,6 +1043,46 @@ class LARS(Optimizer):
         self._update_impl(index, weight, grad, state,
                           multi_precision=use_multi_precision)
 
+
+@register
+class LAMB(Optimizer):
+    """LAMB Optimizer.
+    """
+    def __init__(self, learning_rate=0.001, beta1=0.9, beta2=0.999, epsilon=1e-6,
+                    lower_bound=1e-3, upper_bound=10.0, bias_correction=False, **kwargs):
+        super(LAMB, self).__init__(learning_rate=learning_rate, **kwargs)
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.epsilon = epsilon
+        self.lower_bound = lower_bound
+        self.upper_bound = upper_bound
+        self.bias_correction = bias_correction
+
+    def create_state(self, index, weight):
+        stype = weight.stype
+        dtype = weight.dtype
+        return (zeros(weight.shape, weight.context, dtype=dtype, stype=stype),
+                zeros(weight.shape, weight.context, dtype=dtype, stype=stype))
+
+    def update(self, index, weight,grad, state):
+        assert(isinstance(weight, NDArray))
+        assert(isinstance(grad, NDArray))
+        self._update_count(index)
+        lr = self._get_lr(index)
+        wd = self._get_wd(index)
+        t = self._index_update_count[index]
+
+        kwargs = {'beta1': self.beta1, 'beta2': self.beta2, 'epsilon': self.epsilon,
+                  'lower_bound': self.lower_bound, 'upper_bound': self.upper_bound,
+                  'bias_correction': self.bias_correction, 't': t,
+                  'rescale_grad': self.rescale_grad}
+        if self.clip_gradient:
+            kwargs['clip_gradient'] = self.clip_gradient
+
+        mean, var = state
+        lamb_update(weight, grad, mean, var, out=weight, lr=lr, wd=wd, **kwargs)
+
+
 #
 @register
 class LBSGD(Optimizer):
